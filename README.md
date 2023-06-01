@@ -8,7 +8,7 @@
 
 CFSSL is CloudFlare's PKI/TLS swiss army knife. It is both a command line
 tool and an HTTP API server for signing, verifying, and bundling TLS
-certificates. It requires Go 1.8+ to build.
+certificates. It requires Go 1.16+ to build.
 
 Note that certain linux distributions have certain algorithms removed
 (RHEL-based distributions in particular), so the golang from the
@@ -29,40 +29,69 @@ CFSSL consists of:
 
 ### Building
 
-See [BUILDING](BUILDING.md)
+Building cfssl requires a
+[working Go 1.16+ installation](http://golang.org/doc/install).
+
+```
+$ git clone git@github.com:cloudflare/cfssl.git
+$ cd cfssl
+$ make
+```
+
+The resulting binaries will be in the bin folder:
+```
+$ tree bin
+bin
+├── cfssl
+├── cfssl-bundle
+├── cfssl-certinfo
+├── cfssl-newkey
+├── cfssl-scan
+├── cfssljson
+├── mkbundle
+└── multirootca
+
+0 directories, 8 files
+```
+
+#### Cross Compilation
+
+You can set the `GOOS` and `GOARCH` environment variables to have Go cross compile for alternative platforms; however, cfssl requires cgo, and cgo requires a working compiler toolchain for the target platform.
 
 ### Installation
 
-Installation requires a
-[working Go 1.8+ installation](http://golang.org/doc/install) and a
-properly set `GOPATH`.
+Installation requires a [working Go 1.16+ installation](http://golang.org/doc/install).
+Alternatively, [prebuilt binaries are available](https://github.com/cloudflare/cfssl/releases)
 
 ```
-$ go get -u github.com/cloudflare/cfssl/cmd/cfssl
+$ go get github.com/cloudflare/cfssl/cmd/cfssl
 ```
 
-will download and build the CFSSL tool, installing it in
-`$GOPATH/bin/cfssl`.
+will download, build, and install the CFSSL tool.
 
 To install any of the other utility programs that are
 in this repo (for instance `cfssljson` in this case):
 
 ```
-$ go get -u github.com/cloudflare/cfssl/cmd/cfssljson
+$ go get github.com/cloudflare/cfssl/cmd/cfssljson
 ```
 
-This will download and build the CFSSLJSON tool, installing it in
-`$GOPATH/bin/`.
+This will download, build, and install the CFSSLJSON tool.
 
 And to simply install __all__ of the programs in this repo:
 
 ```
-$ go get -u github.com/cloudflare/cfssl/cmd/...
+$ go get github.com/cloudflare/cfssl/cmd/...
+```
+
+if you are above go 1.18:
+
+```
+$ go install github.com/cloudflare/cfssl/cmd/...@latest
 ```
 
 This will download, build, and install all of the utility programs
-(including `cfssl`, `cfssljson`, and `mkbundle` among others) into the
-`$GOPATH/bin/` directory.
+(including `cfssl`, `cfssljson`, and `mkbundle` among others).
 
 ### Using the Command Line Tool
 
@@ -210,7 +239,10 @@ the key request as a JSON file. This file should follow the form:
 {
     "hosts": [
         "example.com",
-        "www.example.com"
+        "www.example.com",
+        "https://www.example.com",
+        "jdoe@example.com",
+        "127.0.0.1"
     ],
     "key": {
         "algo": "rsa",
@@ -272,7 +304,7 @@ OCSP server.
 ### Starting the API Server
 
 CFSSL comes with an HTTP-based API server; the endpoints are
-documented in `doc/api/intro.txt`. The server is started with the `serve`
+documented in [`doc/api/intro.txt`](doc/api/intro.txt). The server is started with the `serve`
 command:
 
 ```
@@ -327,7 +359,7 @@ for configuring and running the CA.
 verifying certificates. It can be installed with
 
 ```
-go get -u github.com/cloudflare/cfssl/cmd/mkbundle
+go get github.com/cloudflare/cfssl/cmd/mkbundle
 ```
 
 It takes a collection of certificates, checks for CRL revocation (OCSP
@@ -385,6 +417,4 @@ Then building with `go build` will use the embedded resources.
 
 Additional documentation can be found in the "doc" directory:
 
-* `api/intro.txt`: documents the API endpoints
-* `bootstrap.txt`: a walkthrough from building the package to getting
-  up and running
+* [doc/api/intro.txt](doc/api/intro.txt): documents the API endpoints

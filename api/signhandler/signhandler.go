@@ -3,7 +3,7 @@ package signhandler
 
 import (
 	"encoding/json"
-	"io/ioutil"
+	"io"
 	"math/big"
 	"net/http"
 
@@ -114,7 +114,7 @@ func jsonReqToTrue(js jsonSignRequest) signer.SignRequest {
 func (h *Handler) Handle(w http.ResponseWriter, r *http.Request) error {
 	log.Info("signature request received")
 
-	body, err := ioutil.ReadAll(r.Body)
+	body, err := io.ReadAll(r.Body)
 	if err != nil {
 		return err
 	}
@@ -219,7 +219,7 @@ func (h *AuthHandler) SetBundler(caBundleFile, intBundleFile string) (err error)
 func (h *AuthHandler) Handle(w http.ResponseWriter, r *http.Request) error {
 	log.Info("signature request received")
 
-	body, err := ioutil.ReadAll(r.Body)
+	body, err := io.ReadAll(r.Body)
 	if err != nil {
 		log.Errorf("failed to read response body: %v", err)
 		return err
@@ -258,7 +258,13 @@ func (h *AuthHandler) Handle(w http.ResponseWriter, r *http.Request) error {
 		return errors.NewBadRequestString("no authentication provider")
 	}
 
-	if !profile.Provider.Verify(&aReq) {
+	validAuth := false
+	if profile.Provider.Verify(&aReq) {
+		validAuth = true
+	} else if profile.PrevProvider != nil && profile.PrevProvider.Verify(&aReq) {
+		validAuth = true
+	}
+	if !validAuth {
 		log.Warning("received authenticated request with invalid token")
 		return errors.NewBadRequestString("invalid token")
 	}

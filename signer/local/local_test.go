@@ -2,6 +2,8 @@ package local
 
 import (
 	"bytes"
+	"crypto/ecdsa"
+	"crypto/elliptic"
 	"crypto/rand"
 	"crypto/rsa"
 	"crypto/x509"
@@ -9,11 +11,13 @@ import (
 	"encoding/asn1"
 	"encoding/hex"
 	"encoding/pem"
-	"io/ioutil"
+	"errors"
 	"math/big"
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
+	"os"
 	"reflect"
 	"regexp"
 	"sort"
@@ -27,7 +31,10 @@ import (
 	"github.com/cloudflare/cfssl/helpers"
 	"github.com/cloudflare/cfssl/log"
 	"github.com/cloudflare/cfssl/signer"
-	"github.com/google/certificate-transparency-go"
+	"github.com/stretchr/testify/require"
+
+	ct "github.com/google/certificate-transparency-go"
+	"github.com/zmap/zlint/v3/lint"
 )
 
 const (
@@ -68,9 +75,12 @@ func TestNewSignerFromFilePolicy(t *testing.T) {
 			},
 		},
 	}
-	_, err := NewSignerFromFile(testCaFile, testCaKeyFile, CAConfig.Signing)
+	signer, err := NewSignerFromFile(testCaFile, testCaKeyFile, CAConfig.Signing)
 	if err != nil {
 		t.Fatal(err)
+	}
+	if signer.lintPriv != nil {
+		t.Error("expected signer with LintErrLevel == 0 to have lintPriv == nil")
 	}
 }
 
@@ -149,6 +159,51 @@ func TestNewSignerFromFileEdgeCases(t *testing.T) {
 	}
 }
 
+func TestNewSignerFromFilePolicyLinting(t *testing.T) {
+	// CAConfig is a config that has an explicit "signature" profile that enables
+	// pre-issuance linting.
+	var CAConfig = &config.Config{
+		Signing: &config.Signing{
+			Profiles: map[string]*config.SigningProfile{
+				"signature": {
+					Usage:        []string{"digital signature"},
+					Expiry:       expiry,
+					LintErrLevel: 3,
+				},
+			},
+			Default: &config.SigningProfile{
+				Usage:        []string{"cert sign", "crl sign"},
+				ExpiryString: "43800h",
+				Expiry:       expiry,
+				CAConstraint: config.CAConstraint{IsCA: true},
+			},
+		},
+	}
+	signer, err := NewSignerFromFile(testCaFile, testCaKeyFile, CAConfig.Signing)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// A CAConfig with a signing profile that sets LintErrLevel > 0 should have
+	// a lintPriv key generated.
+	if signer.lintPriv == nil {
+		t.Error("expected signer with profile LintErrLevel > 0 to have lintPriv != nil")
+	}
+
+	// Reconfigure caConfig so that the explicit "signature" profile doesn't
+	// enable pre-issuance linting but the default profile does.
+	CAConfig.Signing.Profiles["signature"].LintErrLevel = 0
+	CAConfig.Signing.Default.LintErrLevel = 3
+	signer, err = NewSignerFromFile(testCaFile, testCaKeyFile, CAConfig.Signing)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// A CAConfig with a default profile that sets LintErrLevel > 0 should have
+	// a lintPriv key generated.
+	if signer.lintPriv == nil {
+		t.Error("expected signer with default profile LintErrLevel > 0 to have lintPriv != nil")
+	}
+}
+
 func TestSign(t *testing.T) {
 	s, err := NewSignerFromFile("testdata/ca.pem", "testdata/ca_key.pem", nil)
 	if err != nil {
@@ -162,13 +217,13 @@ func TestSign(t *testing.T) {
 	}
 
 	// not a csr
-	certPem, err := ioutil.ReadFile("../../helpers/testdata/cert.pem")
+	certPem, err := os.ReadFile("../../helpers/testdata/cert.pem")
 	if err != nil {
 		t.Fatal(err)
 	}
 
 	// csr with ip as hostname
-	pem, err := ioutil.ReadFile("testdata/ip.csr")
+	pem, err := os.ReadFile("testdata/ip.csr")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -186,7 +241,7 @@ func TestSign(t *testing.T) {
 		t.Fatal("A bad case failed to raise an error")
 	}
 
-	pem, err = ioutil.ReadFile("testdata/ex.csr")
+	pem, err = os.ReadFile("testdata/ex.csr")
 	validReq = signer.SignRequest{
 		Request: string(pem),
 		Hosts:   []string{"example.com"},
@@ -242,7 +297,7 @@ const (
 func testSignFile(t *testing.T, certFile string) ([]byte, error) {
 	s := newTestSigner(t)
 
-	pem, err := ioutil.ReadFile(certFile)
+	pem, err := os.ReadFile(certFile)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -316,7 +371,7 @@ func TestSignCSRs(t *testing.T) {
 	s := newTestSigner(t)
 	hostname := "cloudflare.com"
 	for _, test := range csrTests {
-		csr, err := ioutil.ReadFile(test.file)
+		csr, err := os.ReadFile(test.file)
 		if err != nil {
 			t.Fatal("CSR loading error:", err)
 		}
@@ -344,7 +399,7 @@ func TestECDSASigner(t *testing.T) {
 	s := newCustomSigner(t, testECDSACaFile, testECDSACaKeyFile)
 	hostname := "cloudflare.com"
 	for _, test := range csrTests {
-		csr, err := ioutil.ReadFile(test.file)
+		csr, err := os.ReadFile(test.file)
 		if err != nil {
 			t.Fatal("CSR loading error:", err)
 		}
@@ -396,7 +451,7 @@ func TestCAIssuing(t *testing.T) {
 		s := newCustomSigner(t, caFile, caKeyFile)
 		s.policy = CAPolicy
 		for j, csr := range interCSRs {
-			csrBytes, _ := ioutil.ReadFile(csr)
+			csrBytes, _ := os.ReadFile(csr)
 			certBytes, err := s.Sign(signer.SignRequest{Hosts: signer.SplitHosts(hostname), Request: string(csrBytes)})
 			if err != nil {
 				t.Fatal(err)
@@ -405,7 +460,7 @@ func TestCAIssuing(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			keyBytes, _ := ioutil.ReadFile(interKeys[j])
+			keyBytes, _ := os.ReadFile(interKeys[j])
 			interKey, _ := helpers.ParsePrivateKeyPEM(keyBytes)
 			interSigner := &Signer{
 				ca:      interCert,
@@ -414,7 +469,7 @@ func TestCAIssuing(t *testing.T) {
 				sigAlgo: signer.DefaultSigAlgo(interKey),
 			}
 			for _, anotherCSR := range interCSRs {
-				anotherCSRBytes, _ := ioutil.ReadFile(anotherCSR)
+				anotherCSRBytes, _ := os.ReadFile(anotherCSR)
 				bytes, err := interSigner.Sign(
 					signer.SignRequest{
 						Hosts:   signer.SplitHosts(hostname),
@@ -511,7 +566,7 @@ func TestPopulateSubjectFromCSR(t *testing.T) {
 
 }
 func TestOverrideSubject(t *testing.T) {
-	csrPEM, err := ioutil.ReadFile(fullSubjectCSR)
+	csrPEM, err := os.ReadFile(fullSubjectCSR)
 	if err != nil {
 		t.Fatalf("%v", err)
 	}
@@ -525,7 +580,7 @@ func TestOverrideSubject(t *testing.T) {
 	s := newCustomSigner(t, testECDSACaFile, testECDSACaKeyFile)
 
 	request := signer.SignRequest{
-		Hosts:   []string{"127.0.0.1", "localhost", "xyz@example.com"},
+		Hosts:   []string{"127.0.0.1", "localhost", "xyz@example.com", "https://www.cloudflare.com"},
 		Request: string(csrPEM),
 		Subject: req,
 	}
@@ -571,7 +626,7 @@ func TestOverrideSubject(t *testing.T) {
 
 func TestOverwriteHosts(t *testing.T) {
 	for _, csrFile := range []string{testCSR, testSANCSR} {
-		csrPEM, err := ioutil.ReadFile(csrFile)
+		csrPEM, err := os.ReadFile(csrFile)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -597,7 +652,7 @@ func TestOverwriteHosts(t *testing.T) {
 		for _, hosts := range [][]string{
 			nil,
 			{},
-			{"127.0.0.1", "localhost", "xyz@example.com"},
+			{"127.0.0.1", "localhost", "xyz@example.com", "https://www.cloudflare.com"},
 		} {
 			request := signer.SignRequest{
 				Hosts:   hosts,
@@ -625,6 +680,10 @@ func TestOverwriteHosts(t *testing.T) {
 				certHosts = append(certHosts, email)
 			}
 
+			for _, uri := range cert.URIs {
+				certHosts = append(certHosts, uri.String())
+			}
+
 			// compare the sorted host lists
 			sort.Strings(certHosts)
 			sort.Strings(request.Hosts)
@@ -645,7 +704,7 @@ func TestOverwriteHosts(t *testing.T) {
 }
 
 func TestOverrideValidity(t *testing.T) {
-	csrPEM, err := ioutil.ReadFile(fullSubjectCSR)
+	csrPEM, err := os.ReadFile(fullSubjectCSR)
 	if err != nil {
 		t.Fatalf("%v", err)
 	}
@@ -847,7 +906,7 @@ func TestCASignPathlen(t *testing.T) {
 	}
 
 	for _, testCase := range csrPathlenTests {
-		csrPEM, err := ioutil.ReadFile(testCase.csrFile)
+		csrPEM, err := os.ReadFile(testCase.csrFile)
 		if err != nil {
 			t.Fatalf("%v", err)
 		}
@@ -907,7 +966,7 @@ func TestCASignPathlen(t *testing.T) {
 }
 
 func TestNoWhitelistSign(t *testing.T) {
-	csrPEM, err := ioutil.ReadFile(fullSubjectCSR)
+	csrPEM, err := os.ReadFile(fullSubjectCSR)
 	if err != nil {
 		t.Fatalf("%v", err)
 	}
@@ -962,7 +1021,7 @@ func TestNoWhitelistSign(t *testing.T) {
 }
 
 func TestWhitelistSign(t *testing.T) {
-	csrPEM, err := ioutil.ReadFile(fullSubjectCSR)
+	csrPEM, err := os.ReadFile(fullSubjectCSR)
 	if err != nil {
 		t.Fatalf("%v", err)
 	}
@@ -1031,7 +1090,7 @@ func TestWhitelistSign(t *testing.T) {
 }
 
 func TestNameWhitelistSign(t *testing.T) {
-	csrPEM, err := ioutil.ReadFile(fullSubjectCSR)
+	csrPEM, err := os.ReadFile(fullSubjectCSR)
 	if err != nil {
 		t.Fatalf("%v", err)
 	}
@@ -1103,7 +1162,7 @@ func TestNameWhitelistSign(t *testing.T) {
 }
 
 func TestExtensionSign(t *testing.T) {
-	csrPEM, err := ioutil.ReadFile(testCSR)
+	csrPEM, err := os.ReadFile(testCSR)
 	if err != nil {
 		t.Fatalf("%v", err)
 	}
@@ -1213,7 +1272,7 @@ func TestCTFailure(t *testing.T) {
 		t.Fatalf("%v", err)
 	}
 	var pem []byte
-	pem, err = ioutil.ReadFile("testdata/ex.csr")
+	pem, err = os.ReadFile("testdata/ex.csr")
 	if err != nil {
 		t.Fatalf("%v", err)
 	}
@@ -1250,7 +1309,7 @@ func TestCTSuccess(t *testing.T) {
 		t.Fatalf("%v", err)
 	}
 	var pem []byte
-	pem, err = ioutil.ReadFile("testdata/ex.csr")
+	pem, err = os.ReadFile("testdata/ex.csr")
 	if err != nil {
 		t.Fatalf("%v", err)
 	}
@@ -1278,7 +1337,7 @@ func TestReturnPrecert(t *testing.T) {
 	if err != nil {
 		t.Fatalf("%v", err)
 	}
-	csr, err := ioutil.ReadFile("testdata/ex.csr")
+	csr, err := os.ReadFile("testdata/ex.csr")
 	if err != nil {
 		t.Fatalf("%v", err)
 	}
@@ -1330,6 +1389,9 @@ func TestSignFromPrecert(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Failed to generate test key: %s", err)
 	}
+
+	_uri, _ := url.Parse("https://www.cloudflare.com")
+
 	precertBytes, err := testSigner.sign(&x509.Certificate{
 		SignatureAlgorithm: x509.SHA512WithRSA,
 		PublicKey:          k.Public(),
@@ -1347,10 +1409,11 @@ func TestSignFromPrecert(t *testing.T) {
 		IssuingCertificateURL: []string{"url"},
 		DNSNames:              []string{"example.com"},
 		EmailAddresses:        []string{"email@example.com"},
+		URIs:                  []*url.URL{_uri},
 		IPAddresses:           []net.IP{net.ParseIP("1.1.1.1")},
 		CRLDistributionPoints: []string{"crl"},
 		PolicyIdentifiers:     []asn1.ObjectIdentifier{{1, 2, 3}},
-	})
+	}, 0, nil)
 	if err != nil {
 		t.Fatalf("Failed to sign request: %s", err)
 	}
@@ -1419,5 +1482,149 @@ func TestSignFromPrecert(t *testing.T) {
 	_, err = testSigner.SignFromPrecert(precert, scts)
 	if err == nil {
 		t.Fatal("SignFromPrecert didn't fail with signature not from CA")
+	}
+}
+
+func TestLint(t *testing.T) {
+	k, _ := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	serial := big.NewInt(1337)
+
+	// jankyTemplate is an x509 cert template that mostly passes through zlint
+	// without errors/warnings. It is used as the basis of both the signer's issuing
+	// certificate and the end entity certificate that is linted.
+	jankyTemplate := &x509.Certificate{
+		Subject: pkix.Name{
+			CommonName: "janky.cert",
+		},
+		SerialNumber: serial,
+		NotBefore:    time.Now(),
+		NotAfter:     time.Now().AddDate(0, 0, 90),
+		KeyUsage:     x509.KeyUsageDigitalSignature | x509.KeyUsageCertSign,
+		ExtKeyUsage:  []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth, x509.ExtKeyUsageClientAuth},
+		PolicyIdentifiers: []asn1.ObjectIdentifier{
+			{1, 2, 3},
+		},
+		BasicConstraintsValid: true,
+		IsCA:                  true,
+		IssuingCertificateURL: []string{"http://ca.cpu"},
+		SubjectKeyId:          []byte("⚿"),
+		PublicKey:             k.Public(),
+	}
+
+	// Create a self-signed issuer certificate to use as the CA
+	issuerDer, _ := x509.CreateCertificate(rand.Reader, jankyTemplate, jankyTemplate, k.Public(), k)
+	issuerCert, _ := x509.ParseCertificate(issuerDer)
+
+	lintSigner := &Signer{
+		lintPriv: k,
+		ca:       issuerCert,
+	}
+
+	// Reconfigure the template for an end-entity certificate.
+	// On purpose this template will trip the following lints:
+	//   1. e_sub_cert_aia_does_not_contain_ocsp_url because there is no OCSP URL.
+	//   2. e_dnsname_not_valid_tld because `.cert` is not a real TLD
+	serial = big.NewInt(1338)
+	jankyTemplate.SerialNumber = serial
+	jankyTemplate.Subject.CommonName = "www.janky.cert"
+	jankyTemplate.DNSNames = []string{"janky.cert", "www.janky.cert"}
+	jankyTemplate.KeyUsage = x509.KeyUsageDigitalSignature | x509.KeyUsageKeyEncipherment
+	jankyTemplate.ExtKeyUsage = []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth, x509.ExtKeyUsageClientAuth}
+	jankyTemplate.IsCA = false
+
+	ignoredLintNameRegistry, err := lint.GlobalRegistry().Filter(lint.FilterOptions{
+		ExcludeNames: []string{"e_dnsname_not_valid_tld"},
+	})
+	if err != nil {
+		t.Fatalf("failed to construct ignoredLintNamesRegistry: %v", err)
+	}
+
+	ignoredLintSourcesRegistry, err := lint.GlobalRegistry().Filter(lint.FilterOptions{
+		ExcludeSources: lint.SourceList{lint.CABFBaselineRequirements},
+		ExcludeNames:   []string{"e_ecdsa_allowed_ku"},
+	})
+	if err != nil {
+		t.Fatalf("failed to construct ignoredLintSourcesRegistry: %v", err)
+	}
+
+	testCases := []struct {
+		name               string
+		signer             *Signer
+		lintErrLevel       lint.LintStatus
+		lintRegistry       lint.Registry
+		expectedErr        error
+		expectedErrResults map[string]lint.LintResult
+	}{
+		{
+			name:   "linting disabled",
+			signer: lintSigner,
+		},
+		{
+			name:         "signer without lint key",
+			signer:       &Signer{},
+			lintErrLevel: lint.NA,
+			expectedErr:  errors.New(`{"code":2500,"message":"Private key is unavailable"}`),
+		},
+		{
+			name:         "lint results above err level",
+			signer:       lintSigner,
+			lintErrLevel: lint.Notice,
+			expectedErr:  errors.New("pre-issuance linting found 3 error results"),
+			expectedErrResults: map[string]lint.LintResult{
+				"e_sub_cert_aia_does_not_contain_ocsp_url": {Status: 6},
+				"e_dnsname_not_valid_tld":                  {Status: 6},
+				"e_ecdsa_allowed_ku":                       {Status: 6, Details: "Certificate contains invalid key usage(s): KeyUsageKeyEncipherment"},
+			},
+		},
+		{
+			name:         "lint results below err level",
+			signer:       lintSigner,
+			lintErrLevel: lint.Warn,
+			expectedErr:  errors.New("pre-issuance linting found 3 error results"),
+			expectedErrResults: map[string]lint.LintResult{
+				"e_sub_cert_aia_does_not_contain_ocsp_url": {Status: 6},
+				"e_dnsname_not_valid_tld":                  {Status: 6},
+				"e_ecdsa_allowed_ku":                       {Status: 6, Details: "Certificate contains invalid key usage(s): KeyUsageKeyEncipherment"},
+			},
+		},
+		{
+			name:         "ignored lint names, lint results above err level",
+			signer:       lintSigner,
+			lintErrLevel: lint.Notice,
+			lintRegistry: ignoredLintNameRegistry,
+			expectedErr:  errors.New("pre-issuance linting found 2 error results"),
+			expectedErrResults: map[string]lint.LintResult{
+				"e_sub_cert_aia_does_not_contain_ocsp_url": {Status: 6},
+				"e_ecdsa_allowed_ku":                       {Status: 6, Details: "Certificate contains invalid key usage(s): KeyUsageKeyEncipherment"},
+			},
+		},
+		{
+			name:         "ignored lint sources, lint results above err level",
+			signer:       lintSigner,
+			lintErrLevel: lint.Notice,
+			lintRegistry: ignoredLintSourcesRegistry,
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			err := tc.signer.lint(*jankyTemplate, tc.lintErrLevel, tc.lintRegistry)
+			if err != nil && tc.expectedErr == nil {
+				t.Errorf("Expected no err, got %#v", err)
+			} else if err == nil && tc.expectedErr != nil {
+				t.Errorf("Expected err %v, got nil", tc.expectedErr)
+			} else if err != nil && tc.expectedErr != nil {
+				actual := err.Error()
+				expected := tc.expectedErr.Error()
+				require.Equal(t, expected, actual)
+				if len(tc.expectedErrResults) > 0 {
+					le, ok := err.(*LintError)
+					if !ok {
+						t.Fatalf("expected LintError type err, got %v", err)
+					}
+					require.EqualValues(t, tc.expectedErrResults, le.ErrorResults)
+				}
+			}
+		})
 	}
 }

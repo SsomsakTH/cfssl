@@ -1,16 +1,21 @@
-FROM golang:1.9.2
+FROM golang:1.20
 
-ENV USER root
+ARG TARGETPLATFORM
+ARG BUILDPLATFORM
+RUN echo "I am running on $BUILDPLATFORM, building for $TARGETPLATFORM" 
 
-WORKDIR /go/src/github.com/cloudflare/cfssl
-COPY . .
+LABEL org.opencontainers.image.source https://github.com/cloudflare/cfssl
+LABEL org.opencontainers.image.description "Cloudflare's PKI toolkit"
 
-# restore all deps and build
-RUN go get github.com/cloudflare/cfssl_trust/... && \
-    go get github.com/GeertJohan/go.rice/rice && \
-    rice embed-go -i=./cli/serve && \
-    cp -R /go/src/github.com/cloudflare/cfssl_trust /etc/cfssl && \
-    go install ./cmd/...
+ARG TARGETOS
+ARG TARGETARCH
+
+WORKDIR /workdir
+COPY . /workdir
+
+RUN git clone https://github.com/cloudflare/cfssl_trust.git /etc/cfssl && \
+    make clean && \
+    GOOS=${TARGETOS} GOARCH=${TARGETARCH} make all && cp bin/* /usr/bin/
 
 EXPOSE 8888
 
